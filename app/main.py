@@ -5,8 +5,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from app.config import settings
+from app.database import async_session_factory
 
 logger = logging.getLogger(__name__)
 
@@ -49,3 +51,21 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(stock_router, prefix="/api")
 app.include_router(engine_router, prefix="/api")
 app.include_router(ws_router)
+
+
+@app.get("/healthz")
+async def healthcheck():
+    """Basic process, scheduler, and DB health for nginx/systemd checks."""
+    from app.engine.scheduler import scheduler
+
+    db_ok = False
+    async with async_session_factory() as session:
+        await session.execute(text("SELECT 1"))
+        db_ok = True
+
+    return {
+        "status": "ok",
+        "service": "nebula-fastapi",
+        "database": "ok" if db_ok else "error",
+        "scheduler_running": scheduler.running,
+    }

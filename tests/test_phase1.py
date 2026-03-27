@@ -151,6 +151,17 @@ class TestMeAPI:
         assert resp.status_code == 403
 
 
+class TestHealthcheck:
+    @pytest.mark.asyncio
+    async def test_healthcheck(self, client: AsyncClient):
+        resp = await client.get("/healthz")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["service"] == "nebula-fastapi"
+        assert data["database"] == "ok"
+
+
 # ── Broker credentials API tests ─────────────────────────────────────────────
 
 
