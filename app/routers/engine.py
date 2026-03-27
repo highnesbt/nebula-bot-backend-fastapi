@@ -10,6 +10,7 @@ from app.models.engine import FVGGap, OpenPosition, Signal
 from app.models.stock import GlobalConfig
 from app.models.user import User
 from app.schemas.engine import (
+    CompletedCandleOut,
     EngineStatusOut,
     ExitAllOut,
     FVGGapOut,
@@ -18,7 +19,7 @@ from app.schemas.engine import (
     SignalListOut,
     SignalOut,
 )
-from app.engine.runtime import exit_all_with_runtime, start_runtime, stop_runtime
+from app.engine.runtime import exit_all_with_runtime, get_runtime, start_runtime, stop_runtime
 
 router = APIRouter(prefix="/engine", tags=["Engine"])
 
@@ -211,6 +212,35 @@ async def list_position_history(
         .limit(50)
     )
     return [_position_to_dict(p) for p in result.scalars()]
+
+
+@router.get("/candles", response_model=list[CompletedCandleOut])
+async def list_completed_candles(
+    token: str = Query(...),
+    limit: int = Query(100, ge=1, le=500),
+    user: User = Depends(get_current_user),
+):
+    """Return finalized locally built candles for a selected watchlist token."""
+    runtime = get_runtime(user.id)
+    if runtime is None:
+        raise HTTPException(400, "Engine is not running.")
+
+    builder = runtime.tick_manager.get_candle_builder(token)
+    if builder is None:
+        raise HTTPException(404, "No candle builder found for token.")
+
+    candles = builder.get_all_candles()[-limit:]
+    return [
+        CompletedCandleOut(
+            time=c.time,
+            open=c.open,
+            high=c.high,
+            low=c.low,
+            close=c.close,
+            volume=c.volume,
+        )
+        for c in candles
+    ]
 
 
 # ── Signals ───────────────────────────────────────────────────────────────────

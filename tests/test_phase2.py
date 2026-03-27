@@ -291,6 +291,48 @@ class TestPositionsAPI:
         assert len(resp.json()) == 2
 
 
+class TestCandlesAPI:
+    @pytest.mark.asyncio
+    async def test_completed_candles_requires_running_engine(self, client, auth_headers):
+        resp = await client.get("/api/engine/candles", params={"token": "3045"}, headers=auth_headers)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_completed_candles_returns_built_candles(
+        self, client, auth_headers, db_session, test_user
+    ):
+        from app.engine.runtime import start_runtime, stop_runtime
+        from app.models.user import BrokerCredential
+
+        cred = BrokerCredential(user_id=test_user.id)
+        cred.api_key = "KEY"
+        cred.client_id = "CID"
+        cred.password = "PW"
+        cred.totp_secret = "TS"
+        db_session.add(cred)
+
+        wi = WatchlistItem(
+            user_id=test_user.id, symbol="SBIN-EQ", token="3045", quantity=1,
+        )
+        db_session.add(wi)
+        await db_session.commit()
+
+        runtime = await start_runtime(db_session, test_user.id)
+        runtime.tick_manager.seed_candle_builder("3045", [
+            ["2024-01-01T09:15:00", 100, 105, 95, 102, 1000],
+            ["2024-01-01T09:20:00", 102, 108, 100, 106, 2000],
+        ])
+
+        resp = await client.get("/api/engine/candles", params={"token": "3045"}, headers=auth_headers)
+        assert resp.status_code == 200
+        candles = resp.json()
+        assert len(candles) == 2
+        assert candles[0]["open"] == 100.0
+        assert candles[1]["close"] == 106.0
+
+        await stop_runtime(db_session, test_user.id, cancel_pending_orders=False)
+
+
 # ── Signals tests ─────────────────────────────────────────────────────────────
 
 

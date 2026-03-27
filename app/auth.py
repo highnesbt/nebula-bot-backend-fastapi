@@ -62,9 +62,14 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db),
 ):
     """Dependency that extracts and validates the current user from JWT."""
+    return await get_user_from_token(credentials.credentials, db)
+
+
+async def get_user_from_token(token: str, db: AsyncSession):
+    """Resolve a JWT access token to a user."""
     from app.models.user import User
 
-    payload = decode_token(credentials.credentials)
+    payload = decode_token(token)
 
     if payload.get("type") != "access":
         raise HTTPException(

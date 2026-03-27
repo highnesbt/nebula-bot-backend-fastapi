@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set
 
 from app.engine.candle_builder import CandleBuilder
-from app.engine.time_utils import market_now
+from app.engine.time_utils import market_now, parse_exchange_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ EXCHANGE_TYPE_MAP = {
 MODE_LTP = 1         # LTP only — minimal bandwidth
 MODE_QUOTE = 2       # LTP + OHLC + volume
 MODE_SNAP_QUOTE = 3  # Full quote with OI
+DEFAULT_SUBSCRIPTION_MODE = MODE_QUOTE
 
 
 class TickDataManager:
@@ -52,6 +53,7 @@ class TickDataManager:
         tick_evaluator=None,
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
         candle_close_callback=None,
+        subscription_mode: int = DEFAULT_SUBSCRIPTION_MODE,
     ):
         self._auth_token = auth_token
         self._feed_token = feed_token
@@ -63,6 +65,7 @@ class TickDataManager:
         self._candle_close_callback = candle_close_callback
         self._connection_open_callback = None
         self._connection_close_callback = None
+        self._subscription_mode = subscription_mode
 
         self._lock = threading.Lock()
         self._ltp_data: Dict[str, float] = {}
@@ -70,6 +73,7 @@ class TickDataManager:
         self._subscribed_tokens: List[dict] = []
         self._subscribed_set: Set[str] = set()
         self._last_tick_at: Dict[str, datetime] = {}
+        self._clock_drift_warned_at: Dict[str, float] = {}
 
         # token → symbol name mapping for broadcasts
         self._token_symbols: Dict[str, str] = {}
@@ -147,7 +151,7 @@ class TickDataManager:
 
         if self._connected and self._ws:
             try:
-                self._ws.subscribe("nebula_tick", MODE_LTP, token_list)
+                self._ws.subscribe("nebula_tick", self._subscription_mode, token_list)
                 logger.info("Subscribed to %d tokens via WebSocket", len(tokens))
             except Exception as e:
                 logger.warning("Subscribe failed: %s", e)
@@ -170,7 +174,7 @@ class TickDataManager:
 
         if self._connected and self._ws:
             try:
-                self._ws.unsubscribe("nebula_unsub", MODE_LTP, token_list)
+                self._ws.unsubscribe("nebula_unsub", self._subscription_mode, token_list)
             except Exception as e:
                 logger.warning("Unsubscribe failed: %s", e)
 
@@ -260,7 +264,7 @@ class TickDataManager:
 
         if token_list:
             try:
-                self._ws.subscribe("nebula_tick", MODE_LTP, token_list)
+                self._ws.subscribe("nebula_tick", self._subscription_mode, token_list)
                 logger.info("Re-subscribed to %d groups on reconnect", len(token_list))
             except Exception as e:
                 logger.warning("Re-subscribe on open failed: %s", e)
@@ -289,7 +293,9 @@ class TickDataManager:
             return
 
         ltp = raw_ltp / 100.0
-        now = market_now()
+        exchange_time = self._extract_tick_timestamp(data)
+        now = exchange_time or market_now()
+        self._monitor_clock_drift(token, exchange_time)
 
         # 1. Update LTP + feed candle builder
         finalized_candle = None
@@ -469,3 +475,38 @@ class TickDataManager:
                 self._connection_close_callback("ws_closed", "WebSocket closed"),
                 self._loop,
             )
+
+    def _extract_tick_timestamp(self, data: dict) -> datetime | None:
+        for key in (
+            "exchange_timestamp",
+            "exchange_time",
+            "last_traded_timestamp",
+            "ltt",
+            "timestamp",
+            "exchangeTime",
+            "last_traded_time",
+        ):
+            parsed = parse_exchange_timestamp(data.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _monitor_clock_drift(self, token: str, exchange_time: datetime | None):
+        if exchange_time is None:
+            return
+
+        drift_seconds = abs((market_now() - exchange_time).total_seconds())
+        if drift_seconds < 2.0:
+            return
+
+        now_mono = time.monotonic()
+        last_warn = self._clock_drift_warned_at.get(token, 0.0)
+        if now_mono - last_warn < 60:
+            return
+
+        self._clock_drift_warned_at[token] = now_mono
+        logger.warning(
+            "Clock drift detected for token %s: local vs exchange time differs by %.2fs",
+            token,
+            drift_seconds,
+        )

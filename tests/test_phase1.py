@@ -1,7 +1,10 @@
 """Phase 1 tests — models, auth, and API endpoints."""
 
 import pytest
+from fastapi.testclient import TestClient
+from unittest.mock import AsyncMock, patch
 from app.auth import create_access_token, hash_password, verify_password
+from app.main import app
 from app.models.user import BrokerCredential, User, encrypt_value, decrypt_value
 from sqlalchemy.ext.asyncio import AsyncSession
 from httpx import AsyncClient
@@ -203,3 +206,18 @@ class TestBrokerCredentialsAPI:
             "/api/auth/broker/credentials", headers=auth_headers
         )
         assert resp.status_code == 404
+
+
+class TestWebSocketAuth:
+    def test_notifications_ws_requires_valid_token(self):
+        client = TestClient(app)
+        with pytest.raises(Exception):
+            with client.websocket_connect("/ws/notifications?token=invalid.token"):
+                pass
+
+    def test_notifications_ws_accepts_valid_token(self):
+        client = TestClient(app)
+        with patch("app.routers.ws.get_user_from_token", AsyncMock(return_value=object())):
+            token = create_access_token(1)
+            with client.websocket_connect(f"/ws/notifications?token={token}") as ws:
+                ws.send_text("ping")

@@ -154,6 +154,20 @@ async def _cleanup_stale_gaps():
         await db.commit()
 
 
+async def _audit_candles():
+    """Compare local finalized candles with broker candles for active runtimes."""
+    from app.database import async_session_factory
+    from app.engine.runtime import _RUNTIMES, audit_runtime_candles
+
+    async with async_session_factory() as db:
+        for runtime in list(_RUNTIMES.values()):
+            try:
+                await audit_runtime_candles(db, runtime)
+            except Exception as e:
+                logger.error(f"Candle audit error for user {runtime.user_id}: {e}")
+        await db.commit()
+
+
 def setup_scheduler(scan_interval_seconds: int = 30):
     """Configure and start the APScheduler."""
     # Scan cycle — every N seconds during market hours
@@ -193,6 +207,13 @@ def setup_scheduler(scan_interval_seconds: int = 30):
         _cleanup_stale_gaps,
         CronTrigger(hour=9, minute=10, day_of_week="mon-fri", timezone="Asia/Kolkata"),
         id="gap_cleanup",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        _audit_candles,
+        IntervalTrigger(minutes=5),
+        id="candle_audit",
         replace_existing=True,
     )
 

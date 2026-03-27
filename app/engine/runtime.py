@@ -21,7 +21,7 @@ from app.engine.thresholds import sync_all_thresholds
 from app.engine.tick_evaluator import TickEvaluator
 from app.engine.tick_manager import TickDataManager
 from app.engine.time_utils import market_now
-from app.models.engine import PendingOrder
+from app.models.engine import AuditLog, PendingOrder
 from app.models.stock import GlobalConfig, WatchlistItem
 from app.models.user import BrokerCredential
 
@@ -456,6 +456,75 @@ async def _poll_open_orders_loop(runtime: EngineRuntime):
             raise
         except Exception:
             await asyncio.sleep(3)
+
+
+async def audit_runtime_candles(db: AsyncSession, runtime: EngineRuntime):
+    """Compare recent local finalized candles with broker candles and log drift."""
+    interval = INTERVALS.get(runtime.config.candle_interval, runtime.config.candle_interval)
+    to_dt = market_now()
+    from_dt = to_dt - timedelta(minutes=20)
+
+    for token, item in runtime.watchlist_by_token.items():
+        builder = runtime.tick_manager.get_candle_builder(token)
+        if builder is None:
+            continue
+
+        local_candles = builder.get_all_candles()
+        if not local_candles:
+            continue
+
+        try:
+            broker_candles = runtime.broker.get_candle_data(
+                symbol_token=item.token,
+                interval=interval,
+                from_date=from_dt.strftime("%Y-%m-%d %H:%M"),
+                to_date=to_dt.strftime("%Y-%m-%d %H:%M"),
+                exchange=item.exchange,
+            )
+        except Exception as exc:
+            db.add(AuditLog(
+                user_id=runtime.user_id,
+                action="CANDLE_AUDIT_FAILED",
+                symbol=item.symbol,
+                status="FAILED",
+                details=str(exc),
+            ))
+            continue
+
+        broker_map = {
+            str(row[0]): {
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+            }
+            for row in broker_candles
+        }
+
+        local = local_candles[-1]
+        broker = broker_map.get(local.time)
+        if broker is None:
+            continue
+
+        drift = {
+            "open": round(local.open - broker["open"], 4),
+            "high": round(local.high - broker["high"], 4),
+            "low": round(local.low - broker["low"], 4),
+            "close": round(local.close - broker["close"], 4),
+        }
+        status = "MATCH" if all(abs(value) < 0.0001 for value in drift.values()) else "DRIFT"
+        db.add(AuditLog(
+            user_id=runtime.user_id,
+            action="CANDLE_AUDIT",
+            symbol=item.symbol,
+            status=status,
+            details=(
+                f"time={local.time};"
+                f" local=({local.open},{local.high},{local.low},{local.close});"
+                f" broker=({broker['open']},{broker['high']},{broker['low']},{broker['close']});"
+                f" drift={drift}"
+            ),
+        ))
 
 
 EngineRuntime._handle_order_update = _handle_order_update_impl

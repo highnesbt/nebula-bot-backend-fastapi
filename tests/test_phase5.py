@@ -9,6 +9,7 @@ import pytest
 from app.engine.broadcast import ConnectionManager
 from app.engine.runtime import _format_recovery_time, _recover_missing_candles
 from app.engine.tick_manager import TickDataManager
+from app.engine.time_utils import IST, parse_exchange_timestamp
 from app.models.stock import GlobalConfig, WatchlistItem
 
 
@@ -124,6 +125,25 @@ class TestTickDataManager:
             for call in run_threadsafe.call_args_list:
                 call.args[0].close()
 
+    def test_exchange_timestamp_is_used_for_tick(self):
+        mgr = TickDataManager(
+            auth_token="x", feed_token="x", api_key="x", client_code="C1",
+        )
+        mgr.subscribe([{"exchange": "NSE", "token": "3045", "symbol": "SBIN-EQ"}])
+        mgr._on_data(None, {
+            "token": "3045",
+            "last_traded_price": 25050,
+            "exchange_timestamp": "2024-01-01T09:15:01+05:30",
+        })
+        last_tick = mgr.get_last_tick_times()["3045"]
+        assert last_tick == datetime.datetime(2024, 1, 1, 9, 15, 1, tzinfo=IST)
+
+    def test_default_subscription_mode_is_quote(self):
+        mgr = TickDataManager(
+            auth_token="x", feed_token="x", api_key="x", client_code="C1",
+        )
+        assert mgr._subscription_mode == 2
+
 
 class TestRecoveryHelpers:
     def test_format_recovery_time_rounds_down(self):
@@ -163,6 +183,17 @@ class TestRecoveryHelpers:
         assert ok is True
         candles = tick_manager.get_candle_builder("3045").get_all_candles()
         assert len(candles) == 2
+
+
+class TestTimeParsing:
+    def test_parse_exchange_timestamp_epoch_ms(self):
+        parsed = parse_exchange_timestamp(1704080701000)
+        assert parsed is not None
+        assert parsed.tzinfo == IST
+
+    def test_parse_exchange_timestamp_iso(self):
+        parsed = parse_exchange_timestamp("2024-01-01T09:15:01+05:30")
+        assert parsed == datetime.datetime(2024, 1, 1, 9, 15, 1, tzinfo=IST)
 
 
 class TestConnectionManager:
