@@ -3,6 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, patch
+from passlib.hash import django_pbkdf2_sha256
 from app.auth import create_access_token, hash_password, verify_password
 from app.main import app
 from app.models.user import BrokerCredential, User, encrypt_value, decrypt_value
@@ -23,6 +24,10 @@ class TestPasswordHashing:
     def test_wrong_password(self):
         hashed = hash_password("correct")
         assert not verify_password("wrong", hashed)
+
+    def test_verify_migrated_django_password(self):
+        hashed = django_pbkdf2_sha256.hash("legacy-password")
+        assert verify_password("legacy-password", hashed)
 
 
 # ── Encryption tests ─────────────────────────────────────────────────────────
