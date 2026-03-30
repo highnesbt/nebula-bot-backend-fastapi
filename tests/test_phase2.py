@@ -194,6 +194,53 @@ class TestWatchlistAPI:
 
         await stop_runtime(db_session, test_user.id, cancel_pending_orders=False)
 
+    @pytest.mark.asyncio
+    async def test_retry_backrun_after_failed_watchlist_add(
+        self, client, auth_headers, db_session, test_user
+    ):
+        from app.models.stock import GlobalConfig
+        from app.engine.runtime import start_runtime, stop_runtime
+
+        db_session.add(GlobalConfig(user_id=test_user.id, is_active=True))
+        cred = BrokerCredential(user_id=test_user.id)
+        cred.api_key = "KEY"
+        cred.client_id = "CID"
+        cred.password = "PW"
+        cred.totp_secret = "TS"
+        db_session.add(cred)
+        await db_session.commit()
+
+        runtime = await start_runtime(db_session, test_user.id)
+        runtime.broker.get_candle_data = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("historical unavailable"))
+
+        add_resp = await client.post(
+            "/api/watchlist/",
+            json={"symbol": "SBIN-EQ", "token": "3045", "quantity": 1},
+            headers=auth_headers,
+        )
+        assert add_resp.status_code == 200
+        added = add_resp.json()
+        assert added["backrun_status"] == "FAILED"
+        assert "Backrun failed" in added["backrun_error"]
+
+        runtime.broker.get_candle_data = lambda **kwargs: [
+            ["2026-03-30T09:15:00+05:30", 100, 101, 99, 100, 1000],
+            ["2026-03-30T09:20:00+05:30", 100, 102, 99.5, 101, 1100],
+            ["2026-03-30T09:25:00+05:30", 101, 104, 103, 103.5, 1200],
+        ]
+        runtime.broker.get_ltp = lambda exchange, symbol, token: 101.55
+
+        retry_resp = await client.post(
+            f"/api/watchlist/{added['id']}/retry-backrun",
+            headers=auth_headers,
+        )
+        assert retry_resp.status_code == 200
+        retried = retry_resp.json()
+        assert retried["backrun_status"] == "SUCCESS"
+        assert retried["backrun_error"] == ""
+
+        await stop_runtime(db_session, test_user.id, cancel_pending_orders=False)
+
 
 # ── Engine Status tests ───────────────────────────────────────────────────────
 

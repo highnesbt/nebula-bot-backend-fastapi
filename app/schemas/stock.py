@@ -75,6 +75,8 @@ class WatchlistItemOut(BaseModel):
     ema_low: float | None = None
     ema_high: float | None = None
     is_active: bool
+    backrun_status: str
+    backrun_error: str = ""
 
 
 class SearchScripOut(BaseModel):

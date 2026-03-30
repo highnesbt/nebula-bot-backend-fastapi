@@ -91,6 +91,8 @@ class WatchlistItem(Base):
     ema_high: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    backrun_status: Mapped[str] = mapped_column(String(20), default="IDLE")
+    backrun_error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.datetime.now(timezone.utc)
     )

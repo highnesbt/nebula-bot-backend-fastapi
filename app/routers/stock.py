@@ -124,7 +124,24 @@ def _watchlist_to_dict(item: WatchlistItem) -> dict:
         "ema_low": item.ema_low,
         "ema_high": item.ema_high,
         "is_active": item.is_active,
+        "backrun_status": item.backrun_status,
+        "backrun_error": item.backrun_error,
     }
+
+
+async def _run_backrun_for_item(
+    db: AsyncSession,
+    user_id: int,
+    item: WatchlistItem,
+):
+    try:
+        await onboard_watchlist_item(db, user_id, item)
+        runtime = get_runtime(user_id)
+        item.backrun_status = "SUCCESS" if runtime is not None and item.is_active else "IDLE"
+        item.backrun_error = ""
+    except Exception as exc:
+        item.backrun_status = "FAILED"
+        item.backrun_error = f"Backrun failed: {exc}"
 
 
 @router.get("/watchlist/", response_model=list[WatchlistItemOut])
@@ -168,8 +185,12 @@ async def add_to_watchlist(
     )
     db.add(item)
     await db.flush()
+    item.backrun_status = "IDLE"
+    item.backrun_error = ""
     await db.refresh(item)
-    await onboard_watchlist_item(db, user.id, item)
+    await _run_backrun_for_item(db, user.id, item)
+    await db.flush()
+    await db.refresh(item)
     return _watchlist_to_dict(item)
 
 
@@ -213,6 +234,29 @@ async def update_watchlist_item(
         if value is not None:
             setattr(item, key, value)
 
+    await db.flush()
+    await db.refresh(item)
+    return _watchlist_to_dict(item)
+
+
+@router.post("/watchlist/{item_id}/retry-backrun", response_model=WatchlistItemOut)
+async def retry_watchlist_backrun(
+    item_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry historical backrun for an existing watchlist item."""
+    result = await db.execute(
+        select(WatchlistItem).where(
+            WatchlistItem.id == item_id,
+            WatchlistItem.user_id == user.id,
+        )
+    )
+    item = result.scalar_one_or_none()
+    if item is None:
+        raise HTTPException(404, "Watchlist item not found.")
+
+    await _run_backrun_for_item(db, user.id, item)
     await db.flush()
     await db.refresh(item)
     return _watchlist_to_dict(item)
