@@ -298,6 +298,36 @@ class TestCandlesAPI:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_completed_candles_returns_empty_when_builder_not_ready(
+        self, client, auth_headers, db_session, test_user
+    ):
+        from app.engine.runtime import start_runtime, stop_runtime
+        from app.models.stock import GlobalConfig, WatchlistItem
+        from app.models.user import BrokerCredential
+
+        db_session.add(GlobalConfig(user_id=test_user.id, is_active=True))
+        cred = BrokerCredential(user_id=test_user.id)
+        cred.api_key = "KEY"
+        cred.client_id = "CID"
+        cred.password = "PW"
+        cred.totp_secret = "TS"
+        db_session.add(cred)
+
+        wi = WatchlistItem(
+            user_id=test_user.id, symbol="SBIN-EQ", token="3045", quantity=1,
+        )
+        db_session.add(wi)
+        await db_session.commit()
+
+        await start_runtime(db_session, test_user.id)
+
+        resp = await client.get("/api/engine/candles", params={"token": "9999"}, headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+        await stop_runtime(db_session, test_user.id, cancel_pending_orders=False)
+
+    @pytest.mark.asyncio
     async def test_completed_candles_returns_built_candles(
         self, client, auth_headers, db_session, test_user
     ):

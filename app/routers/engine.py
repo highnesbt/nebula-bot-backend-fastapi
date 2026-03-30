@@ -227,7 +227,7 @@ async def list_completed_candles(
 
     builder = runtime.tick_manager.get_candle_builder(token)
     if builder is None:
-        raise HTTPException(404, "No candle builder found for token.")
+        return []
 
     candles = builder.get_all_candles()[-limit:]
     return [
