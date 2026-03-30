@@ -20,6 +20,7 @@ async def analyze_finalized_candle(
     token: str,
     symbol: str,
     finalized_candle,
+    broadcast_scan: bool = True,
 ):
     """Run strategy analysis when a 5-minute candle is finalized."""
     builder = runtime.tick_manager.get_candle_builder(token)
@@ -101,18 +102,19 @@ async def analyze_finalized_candle(
         tick_manager=runtime.tick_manager,
     )
 
-    await ws_manager.broadcast_scan_update(
-        symbol,
-        {
-            "trend": trend.direction,
-            "ema_value": trend.ema_value,
-            "slope": trend.slope,
-            "atr": round(atr_value, 4) if atr_value is not None else None,
-            "new_gaps": created,
-            "candle_time": finalized_candle.time,
-            "entries_paused": runtime.entries_paused,
-        },
-    )
+    if broadcast_scan:
+        await ws_manager.broadcast_scan_update(
+            symbol,
+            {
+                "trend": trend.direction,
+                "ema_value": trend.ema_value,
+                "slope": trend.slope,
+                "atr": round(atr_value, 4) if atr_value is not None else None,
+                "new_gaps": created,
+                "candle_time": finalized_candle.time,
+                "entries_paused": runtime.entries_paused,
+            },
+        )
 
 
 def _parse_candle_time(value: str) -> datetime:

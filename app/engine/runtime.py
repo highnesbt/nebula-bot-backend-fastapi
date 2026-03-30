@@ -15,13 +15,14 @@ from app.config import settings
 from app.engine.analysis import analyze_finalized_candle
 from app.engine.auto_exit import auto_exit_all_positions
 from app.engine.broadcast import ws_manager
+from app.engine.executor import execute_entry
 from app.engine.order_manager import OrderManager
 from app.engine.order_ws import OrderUpdateManager
 from app.engine.thresholds import sync_all_thresholds
 from app.engine.tick_evaluator import TickEvaluator
 from app.engine.tick_manager import TickDataManager
-from app.engine.time_utils import market_now
-from app.models.engine import AuditLog, PendingOrder
+from app.engine.time_utils import market_now, parse_exchange_timestamp
+from app.models.engine import AuditLog, FVGGap, OpenPosition, PendingOrder
 from app.models.stock import GlobalConfig, WatchlistItem
 from app.models.user import BrokerCredential
 
@@ -178,6 +179,28 @@ async def refresh_runtime_thresholds(db: AsyncSession, user_id: int):
         await runtime.refresh_thresholds(db)
 
 
+async def onboard_watchlist_item(
+    db: AsyncSession,
+    user_id: int,
+    item: WatchlistItem,
+):
+    """Attach a newly added watchlist item to an active runtime, if one exists."""
+    runtime = _RUNTIMES.get(user_id)
+    if runtime is None or not item.is_active:
+        return
+
+    runtime.watchlist_by_token[item.token] = item
+    _prepare_tick_manager(runtime, list(runtime.watchlist_by_token.values()))
+
+    candles = await _fetch_historical_candles(runtime, item)
+    finalized = _filter_finalized_candles(candles, runtime.config.candle_interval)
+    if finalized:
+        await _replay_watchlist_history(db, runtime, item, finalized)
+
+    await runtime.refresh_thresholds(db)
+    await _maybe_execute_watchlist_entry(db, runtime, item)
+
+
 async def exit_all_with_runtime(db: AsyncSession, user_id: int) -> dict:
     """Use the active runtime broker if present, else create a temporary broker session."""
     runtime = _RUNTIMES.get(user_id)
@@ -288,6 +311,143 @@ async def _seed_warmup_candles(runtime: EngineRuntime, watchlist_items: list[Wat
             candles = []
         if candles:
             runtime.tick_manager.seed_candle_builder(item.token, candles[-60:])
+
+
+async def _fetch_historical_candles(runtime: EngineRuntime, item: WatchlistItem) -> list:
+    to_dt = market_now()
+    from_dt = to_dt - timedelta(days=5)
+    interval = INTERVALS.get(runtime.config.candle_interval, runtime.config.candle_interval)
+
+    try:
+        return runtime.broker.get_candle_data(
+            symbol_token=item.token,
+            interval=interval,
+            from_date=from_dt.strftime("%Y-%m-%d %H:%M"),
+            to_date=to_dt.strftime("%Y-%m-%d %H:%M"),
+            exchange=item.exchange,
+        ) or []
+    except Exception:
+        return []
+
+
+def _filter_finalized_candles(raw_candles: list, candle_interval: str) -> list:
+    if not raw_candles:
+        return []
+
+    now = market_now()
+    interval_minutes = {
+        "ONE_MINUTE": 1,
+        "THREE_MINUTE": 3,
+        "FIVE_MINUTE": 5,
+        "TEN_MINUTE": 10,
+        "FIFTEEN_MINUTE": 15,
+        "THIRTY_MINUTE": 30,
+        "ONE_HOUR": 60,
+    }.get(candle_interval, 5)
+    minute = floor(now.minute / interval_minutes) * interval_minutes
+    current_candle_start = now.replace(minute=minute, second=0, microsecond=0)
+
+    filtered = []
+    for row in sorted(raw_candles, key=lambda value: value[0]):
+        candle_time = parse_exchange_timestamp(row[0])
+        if candle_time is None:
+            continue
+        if candle_time >= current_candle_start:
+            continue
+        filtered.append(row)
+    return filtered
+
+
+async def _replay_watchlist_history(
+    db: AsyncSession,
+    runtime: EngineRuntime,
+    item: WatchlistItem,
+    finalized_candles: list,
+):
+    today = market_now().date()
+
+    for index in range(len(finalized_candles)):
+        runtime.tick_manager.seed_candle_builder(item.token, finalized_candles[: index + 1])
+        candle_time = parse_exchange_timestamp(finalized_candles[index][0])
+        if candle_time is None or candle_time.date() != today:
+            continue
+
+        builder = runtime.tick_manager.get_candle_builder(item.token)
+        if builder is None or len(builder.get_all_candles()) < 3:
+            continue
+
+        await analyze_finalized_candle(
+            db,
+            runtime,
+            item.token,
+            item.symbol,
+            builder.get_all_candles()[-1],
+            broadcast_scan=False,
+        )
+
+
+async def _maybe_execute_watchlist_entry(
+    db: AsyncSession,
+    runtime: EngineRuntime,
+    item: WatchlistItem,
+):
+    if runtime.entries_paused:
+        return
+
+    open_position = await db.execute(
+        select(OpenPosition).where(
+            OpenPosition.user_id == runtime.user_id,
+            OpenPosition.watchlist_item_id == item.id,
+            OpenPosition.is_open == True,
+        )
+    )
+    if open_position.scalar_one_or_none() is not None:
+        return
+
+    open_pending = await db.execute(
+        select(PendingOrder).where(
+            PendingOrder.user_id == runtime.user_id,
+            PendingOrder.watchlist_item_id == item.id,
+            PendingOrder.order_type == "ENTRY",
+            PendingOrder.status == "OPEN",
+        )
+    )
+    if open_pending.scalar_one_or_none() is not None:
+        return
+
+    ltp = runtime.tick_manager.get_ltp(item.token)
+    if ltp is None:
+        try:
+            ltp = runtime.broker.get_ltp(item.exchange, item.symbol, item.token)
+        except Exception:
+            ltp = None
+    if ltp is None:
+        return
+
+    action = runtime.tick_evaluator.on_tick(item.token, ltp)
+    if action is None or action.action_type != "ENTRY" or action.watchlist_item_id != item.id:
+        return
+
+    gap_result = await db.execute(
+        select(FVGGap).where(
+            FVGGap.id == action.gap_id,
+            FVGGap.user_id == runtime.user_id,
+            FVGGap.is_active == True,
+        )
+    )
+    gap = gap_result.scalar_one_or_none()
+    if gap is None:
+        return
+
+    await execute_entry(
+        db,
+        runtime.user_id,
+        gap,
+        item,
+        runtime.broker,
+        runtime.config,
+        ltp,
+    )
 
 
 async def _start_market_streams(runtime: EngineRuntime, cred: BrokerCredential):

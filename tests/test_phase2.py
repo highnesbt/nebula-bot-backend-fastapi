@@ -5,7 +5,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.engine import FVGGap, OpenPosition, Signal
+from app.models.engine import FVGGap, OpenPosition, PendingOrder, Signal
 from app.models.stock import WatchlistItem
 from app.models.user import BrokerCredential, User
 from app.engine.runtime import get_runtime
@@ -123,6 +123,76 @@ class TestWatchlistAPI:
     async def test_get_nonexistent(self, client, auth_headers):
         resp = await client.get("/api/watchlist/9999", headers=auth_headers)
         assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_add_watchlist_item_backfills_and_places_manual_entry(
+        self, client, auth_headers, db_session, test_user
+    ):
+        from datetime import timedelta
+
+        from app.engine.time_utils import market_now
+        from app.models.stock import GlobalConfig
+        from app.engine.runtime import start_runtime, stop_runtime
+
+        db_session.add(GlobalConfig(
+            user_id=test_user.id,
+            is_active=True,
+            trend_ema_period=2,
+            trend_slope_lookback=1,
+            trend_slope_threshold=0.01,
+            atr_period=2,
+            min_gap_percent=0.0,
+        ))
+
+        cred = BrokerCredential(user_id=test_user.id)
+        cred.api_key = "KEY"
+        cred.client_id = "CID"
+        cred.password = "PW"
+        cred.totp_secret = "TS"
+        db_session.add(cred)
+        await db_session.commit()
+
+        runtime = await start_runtime(db_session, test_user.id)
+
+        now = market_now().replace(second=0, microsecond=0)
+        base = now - timedelta(minutes=25)
+        base = base.replace(minute=(base.minute // 5) * 5)
+        candles = [
+            [base.isoformat(), 100, 101, 99, 100, 1000],
+            [(base + timedelta(minutes=5)).isoformat(), 100, 102, 99.5, 101, 1100],
+            [(base + timedelta(minutes=10)).isoformat(), 101, 104, 103, 103.5, 1200],
+        ]
+
+        runtime.broker.get_candle_data = lambda **kwargs: candles
+        runtime.broker.get_ltp = lambda exchange, symbol, token: 101.55
+
+        resp = await client.post(
+            "/api/watchlist/",
+            json={"symbol": "SBIN-EQ", "token": "3045", "quantity": 1},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+
+        result = await db_session.execute(select(FVGGap).where(FVGGap.user_id == test_user.id))
+        gaps = list(result.scalars())
+        assert len(gaps) == 1
+        assert gaps[0].gap_type == "LONG"
+
+        pending_result = await db_session.execute(
+            select(PendingOrder).where(
+                PendingOrder.user_id == test_user.id,
+                PendingOrder.order_type == "ENTRY",
+                PendingOrder.status == "OPEN",
+            )
+        )
+        pending = pending_result.scalar_one_or_none()
+        assert pending is not None
+
+        builder = runtime.tick_manager.get_candle_builder("3045")
+        assert builder is not None
+        assert len(builder.get_all_candles()) == 3
+
+        await stop_runtime(db_session, test_user.id, cancel_pending_orders=False)
 
 
 # ── Engine Status tests ───────────────────────────────────────────────────────

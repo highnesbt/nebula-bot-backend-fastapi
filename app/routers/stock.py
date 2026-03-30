@@ -10,6 +10,7 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.models.stock import GlobalConfig, WatchlistItem
 from app.models.user import BrokerCredential, User
+from app.engine.runtime import onboard_watchlist_item
 from app.schemas.stock import (
     GlobalConfigIn,
     GlobalConfigOut,
@@ -161,6 +162,7 @@ async def add_to_watchlist(
     db.add(item)
     await db.flush()
     await db.refresh(item)
+    await onboard_watchlist_item(db, user.id, item)
     return _watchlist_to_dict(item)
 
 
