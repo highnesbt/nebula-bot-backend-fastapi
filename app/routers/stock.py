@@ -10,7 +10,7 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.models.stock import GlobalConfig, WatchlistItem
 from app.models.user import BrokerCredential, User
-from app.engine.runtime import onboard_watchlist_item
+from app.engine.runtime import onboard_watchlist_item, refresh_runtime_thresholds, get_runtime
 from app.schemas.stock import (
     GlobalConfigIn,
     GlobalConfigOut,
@@ -100,6 +100,13 @@ async def update_config(
     for key, value in data.items():
         if value is not None:
             setattr(config, key, value)
+
+    runtime = get_runtime(user.id)
+    if runtime is not None:
+        for key, value in data.items():
+            if value is not None:
+                setattr(runtime.config, key, value)
+        await refresh_runtime_thresholds(db, user.id)
 
     return _config_to_dict(config)
 
