@@ -2,6 +2,7 @@
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.engine import FVGGap, OpenPosition, Signal
@@ -136,6 +137,25 @@ class TestEngineAPI:
         assert data["is_active"] is False
         assert data["open_positions"] == 0
         assert data["active_gaps"] == 0
+
+    @pytest.mark.asyncio
+    async def test_engine_status_clears_stale_active_flag(
+        self, client, auth_headers, db_session, test_user
+    ):
+        from app.models.stock import GlobalConfig
+
+        db_session.add(GlobalConfig(user_id=test_user.id, is_active=True))
+        await db_session.commit()
+
+        resp = await client.get("/api/engine/status", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.json()["is_active"] is False
+
+        result = await db_session.execute(
+            select(GlobalConfig).where(GlobalConfig.user_id == test_user.id)
+        )
+        config = result.scalar_one()
+        assert config.is_active is False
 
     @pytest.mark.asyncio
     async def test_start_stop_engine(self, client, auth_headers, db_session, test_user):
@@ -295,7 +315,8 @@ class TestCandlesAPI:
     @pytest.mark.asyncio
     async def test_completed_candles_requires_running_engine(self, client, auth_headers):
         resp = await client.get("/api/engine/candles", params={"token": "3045"}, headers=auth_headers)
-        assert resp.status_code == 400
+        assert resp.status_code == 200
+        assert resp.json() == []
 
     @pytest.mark.asyncio
     async def test_completed_candles_returns_empty_when_builder_not_ready(

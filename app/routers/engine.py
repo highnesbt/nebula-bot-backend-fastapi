@@ -37,7 +37,12 @@ async def engine_status(
         select(GlobalConfig).where(GlobalConfig.user_id == user.id)
     )
     config = config_result.scalar_one_or_none()
-    is_active = config.is_active if config else False
+    runtime = get_runtime(user.id)
+    is_active = runtime is not None
+    if config and config.is_active and not is_active:
+        # Service restarts clear in-memory runtimes; expose and persist the
+        # real state so the UI does not treat a stale DB flag as a live engine.
+        config.is_active = False
 
     pos_result = await db.execute(
         select(func.count()).select_from(OpenPosition).where(
@@ -223,7 +228,7 @@ async def list_completed_candles(
     """Return finalized locally built candles for a selected watchlist token."""
     runtime = get_runtime(user.id)
     if runtime is None:
-        raise HTTPException(400, "Engine is not running.")
+        return []
 
     builder = runtime.tick_manager.get_candle_builder(token)
     if builder is None:
