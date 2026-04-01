@@ -39,6 +39,7 @@ class EngineRuntime:
     entries_paused: bool = False
     recovery_in_progress: bool = False
     recovery_failed: bool = False
+    session_refresh_in_progress: bool = False
     disconnected_at: object = None
     watchlist_by_token: dict[str, WatchlistItem] = field(default_factory=dict)
 
@@ -92,9 +93,10 @@ async def start_runtime(db: AsyncSession, user_id: int) -> EngineRuntime:
 
     broker = get_broker_client(cred.api_key)
     try:
-        broker.login(cred.client_id, cred.password, cred.totp_secret)
+        login_data = broker.login(cred.client_id, cred.password, cred.totp_secret)
     except Exception as exc:
         raise HTTPException(400, f"Broker login failed: {exc}")
+    _store_broker_session_tokens(cred, login_data=login_data)
 
     evaluator = TickEvaluator(
         user_id=user_id,
@@ -121,6 +123,7 @@ async def start_runtime(db: AsyncSession, user_id: int) -> EngineRuntime:
         tick_evaluator=evaluator,
         tick_manager=tick_manager,
     )
+    _bind_runtime_broker(runtime)
 
     tick_manager.set_candle_close_callback(runtime._handle_candle_close)
 
@@ -161,6 +164,7 @@ async def stop_runtime(
         await _cancel_open_pending_orders(db, user_id, broker, reason="ENGINE_STOP")
 
     if runtime is not None:
+        _bind_runtime_broker(runtime, active=False)
         if runtime.polling_task is not None:
             runtime.polling_task.cancel()
         if runtime.order_updates is not None:
@@ -177,6 +181,43 @@ async def refresh_runtime_thresholds(db: AsyncSession, user_id: int):
     runtime = _RUNTIMES.get(user_id)
     if runtime is not None:
         await runtime.refresh_thresholds(db)
+
+
+async def refresh_runtime_broker_session(
+    db: AsyncSession,
+    user_id: int,
+    restart_streams: bool = True,
+) -> bool:
+    """Refresh a user's broker session and sync any active runtime."""
+    cred = await _load_credentials(db, user_id, required=False)
+    if cred is None:
+        return False
+
+    runtime = _RUNTIMES.get(user_id)
+    broker = runtime.broker if runtime is not None else get_broker_client(cred.api_key)
+
+    listener_setter = getattr(broker, "set_session_listener", None)
+    previous_listener = getattr(broker, "_session_listener", None)
+    if runtime is not None and callable(listener_setter):
+        listener_setter(None)
+
+    try:
+        login_data = broker.login(cred.client_id, cred.password, cred.totp_secret)
+    finally:
+        if runtime is not None and callable(listener_setter):
+            listener_setter(previous_listener)
+
+    _store_broker_session_tokens(cred, login_data=login_data)
+
+    if runtime is not None and restart_streams:
+        session = _session_tokens_from_login_data(login_data, broker, cred)
+        await _apply_runtime_session_refresh(runtime, session, broadcast=False)
+        await ws_manager.broadcast_engine_event(
+            "broker_session_refreshed",
+            {"user_id": user_id},
+        )
+
+    return True
 
 
 async def onboard_watchlist_item(
@@ -272,6 +313,61 @@ async def _load_watchlist(db: AsyncSession, user_id: int) -> list[WatchlistItem]
         )
     )
     return list(result.scalars())
+
+
+def _session_tokens_from_login_data(
+    login_data: dict | None,
+    broker,
+    cred: BrokerCredential,
+) -> dict:
+    payload = (login_data or {}).get("data") or {}
+    session_tokens = getattr(broker, "session_tokens", {}) or {}
+    return {
+        "auth_token": session_tokens.get("auth_token") or payload.get("jwtToken", ""),
+        "feed_token": session_tokens.get("feed_token") or payload.get("feedToken", ""),
+        "refresh_token": session_tokens.get("refresh_token") or payload.get("refreshToken", ""),
+        "api_key": session_tokens.get("api_key") or cred.api_key,
+        "client_code": session_tokens.get("client_code") or payload.get("clientcode") or cred.client_id,
+    }
+
+
+def _store_broker_session_tokens(
+    cred: BrokerCredential,
+    login_data: dict | None = None,
+    session_tokens: dict | None = None,
+):
+    payload = session_tokens or (login_data or {}).get("data") or {}
+    cred.jwt_token = payload.get("auth_token") or payload.get("jwtToken") or ""
+    cred.feed_token = payload.get("feed_token") or payload.get("feedToken") or ""
+    cred.refresh_token = payload.get("refresh_token") or payload.get("refreshToken") or ""
+
+
+def _bind_runtime_broker(runtime: EngineRuntime, active: bool = True):
+    setter = getattr(runtime.broker, "set_session_listener", None)
+    if not callable(setter):
+        return
+
+    if not active:
+        setter(None)
+        return
+
+    setter(lambda session: _schedule_runtime_session_refresh(runtime, session))
+
+
+def _schedule_runtime_session_refresh(runtime: EngineRuntime, session: dict):
+    if settings.NEBULA_BROKER_BACKEND != "live":
+        return
+    if _RUNTIMES.get(runtime.user_id) is not runtime:
+        return
+
+    loop = runtime.tick_manager._loop
+    if loop is None or not loop.is_running():
+        return
+
+    asyncio.run_coroutine_threadsafe(
+        _apply_runtime_session_refresh(runtime, session),
+        loop,
+    )
 
 
 def _prepare_tick_manager(runtime: EngineRuntime, watchlist_items: list[WatchlistItem]):
@@ -455,27 +551,87 @@ async def _start_market_streams(runtime: EngineRuntime, cred: BrokerCredential):
         on_open=lambda: runtime._handle_market_reconnect(),
         on_close=lambda code, reason: runtime._handle_market_disconnect(code, reason),
     )
-    ws_credentials = getattr(runtime.broker, "ws_credentials", None)
-    if settings.NEBULA_BROKER_BACKEND == "live" and ws_credentials:
-        runtime.tick_manager._auth_token = ws_credentials.get("auth_token", "")
-        runtime.tick_manager._feed_token = ws_credentials.get("feed_token", "")
-        runtime.tick_manager._api_key = ws_credentials.get("api_key", cred.api_key)
-        runtime.tick_manager._client_code = ws_credentials.get("client_code", cred.client_id)
-        runtime.tick_manager.start()
+    session = getattr(runtime.broker, "ws_credentials", None) or {
+        "api_key": cred.api_key,
+        "client_code": cred.client_id,
+    }
+    await _apply_runtime_session_refresh(runtime, session, broadcast=False)
 
-        runtime.order_updates = OrderUpdateManager()
-        runtime.order_updates.start(
-            ws_credentials.get("auth_token", ""),
-            ws_credentials.get("api_key", cred.api_key),
-            ws_credentials.get("client_code", cred.client_id),
-            ws_credentials.get("feed_token", ""),
-            callback=lambda data: runtime._handle_order_update(data),
-            loop=asyncio.get_running_loop(),
-        )
-        if not runtime.order_updates.is_running:
+
+async def _apply_runtime_session_refresh(
+    runtime: EngineRuntime,
+    session: dict,
+    broadcast: bool = True,
+):
+    if runtime.session_refresh_in_progress:
+        return
+
+    runtime.session_refresh_in_progress = True
+    try:
+        if runtime.polling_task is not None:
+            runtime.polling_task.cancel()
+            runtime.polling_task = None
+        if runtime.order_updates is not None:
+            runtime.order_updates.stop()
+            runtime.order_updates = None
+
+        auth_token = session.get("auth_token", "")
+        feed_token = session.get("feed_token", "")
+        api_key = session.get("api_key", runtime.tick_manager._api_key)
+        client_code = session.get("client_code", runtime.tick_manager._client_code)
+
+        if settings.NEBULA_BROKER_BACKEND == "live" and auth_token and feed_token:
+            runtime.tick_manager.restart_with_credentials(
+                auth_token=auth_token,
+                feed_token=feed_token,
+                api_key=api_key,
+                client_code=client_code,
+            )
+
+            runtime.order_updates = OrderUpdateManager()
+            runtime.order_updates.start(
+                auth_token,
+                api_key,
+                client_code,
+                feed_token,
+                callback=lambda data: runtime._handle_order_update(data),
+                loop=asyncio.get_running_loop(),
+            )
+            if not runtime.order_updates.is_running:
+                runtime.polling_task = asyncio.create_task(_poll_open_orders_loop(runtime))
+        else:
             runtime.polling_task = asyncio.create_task(_poll_open_orders_loop(runtime))
-    else:
-        runtime.polling_task = asyncio.create_task(_poll_open_orders_loop(runtime))
+
+        if broadcast:
+            await ws_manager.broadcast_engine_event(
+                "broker_session_refreshed",
+                {"user_id": runtime.user_id},
+            )
+    finally:
+        runtime.session_refresh_in_progress = False
+
+
+async def _refresh_runtime_after_disconnect(runtime: EngineRuntime, code: str, reason: str):
+    from app.database import async_session_factory
+
+    if settings.NEBULA_BROKER_BACKEND != "live":
+        return
+
+    reason_text = f"{code}: {reason}".lower()
+    if not any(snippet in reason_text for snippet in ("invalid", "token", "session", "login")):
+        return
+
+    async with async_session_factory() as db:
+        try:
+            refreshed = await refresh_runtime_broker_session(
+                db,
+                runtime.user_id,
+                restart_streams=True,
+            )
+        except Exception:
+            refreshed = False
+        if refreshed:
+            await db.commit()
 
 
 async def _handle_order_update_impl(runtime: EngineRuntime, data: dict):
@@ -529,6 +685,8 @@ async def _handle_market_disconnect_impl(runtime: EngineRuntime, code: str, reas
     async with async_session_factory() as db:
         await runtime.pause_entries(db, f"{code}: {reason}")
         await db.commit()
+
+    await _refresh_runtime_after_disconnect(runtime, code, reason)
 
 
 async def _handle_market_reconnect_impl(runtime: EngineRuntime):

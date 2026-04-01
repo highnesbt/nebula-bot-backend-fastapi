@@ -106,8 +106,8 @@ async def _auto_exit():
 
 async def _midnight_reauth():
     """Midnight re-authentication — refresh broker sessions (SEBI compliance)."""
-    from app.broker.client import get_broker_client
     from app.database import async_session_factory
+    from app.engine.runtime import refresh_runtime_broker_session
     from app.models.user import BrokerCredential
     from sqlalchemy import select
 
@@ -119,12 +119,11 @@ async def _midnight_reauth():
 
         for cred in creds:
             try:
-                broker = get_broker_client(cred.api_key)
-                login_data = broker.login(cred.client_id, cred.password, cred.totp_secret)
-                # Store the new JWT token
-                if login_data and login_data.get("data"):
-                    cred.jwt_token = login_data["data"].get("jwtToken", "")
-                    cred.feed_token = login_data["data"].get("feedToken", "")
+                await refresh_runtime_broker_session(
+                    db,
+                    cred.user_id,
+                    restart_streams=True,
+                )
                 logger.info(f"Re-auth success for user {cred.user_id}")
             except Exception as e:
                 logger.error(f"Re-auth failed for user {cred.user_id}: {e}")

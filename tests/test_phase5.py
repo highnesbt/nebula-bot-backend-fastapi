@@ -2,15 +2,24 @@
 
 import asyncio
 import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.broker.smart_client import AngelOneClient
+from app.config import settings
 from app.engine.broadcast import ConnectionManager
-from app.engine.runtime import _format_recovery_time, _recover_missing_candles
+from app.engine.runtime import (
+    _RUNTIMES,
+    _format_recovery_time,
+    _recover_missing_candles,
+    refresh_runtime_broker_session,
+)
 from app.engine.tick_manager import TickDataManager
 from app.engine.time_utils import IST, parse_exchange_timestamp
 from app.models.stock import GlobalConfig, WatchlistItem
+from app.models.user import BrokerCredential
 
 
 class TestTickDataManager:
@@ -144,6 +153,20 @@ class TestTickDataManager:
         )
         assert mgr._subscription_mode == 2
 
+    def test_restart_with_credentials_updates_session_values(self):
+        mgr = TickDataManager(
+            auth_token="old-auth", feed_token="old-feed", api_key="old-key", client_code="OLD",
+        )
+        with patch.object(mgr, "stop") as stop_mock, patch.object(mgr, "start") as start_mock:
+            mgr.restart_with_credentials("new-auth", "new-feed", "new-key", "NEW")
+
+        stop_mock.assert_called_once()
+        start_mock.assert_called_once()
+        assert mgr._auth_token == "new-auth"
+        assert mgr._feed_token == "new-feed"
+        assert mgr._api_key == "new-key"
+        assert mgr._client_code == "NEW"
+
 
 class TestRecoveryHelpers:
     def test_format_recovery_time_rounds_down(self):
@@ -184,6 +207,96 @@ class TestRecoveryHelpers:
         candles = tick_manager.get_candle_builder("3045").get_all_candles()
         assert len(candles) == 2
 
+    @pytest.mark.asyncio
+    async def test_refresh_runtime_broker_session_restarts_live_runtime(
+        self, db_session, test_user, monkeypatch
+    ):
+        old_backend = settings.NEBULA_BROKER_BACKEND
+        monkeypatch.setattr(settings, "NEBULA_BROKER_BACKEND", "live")
+
+        cred = BrokerCredential(user_id=test_user.id)
+        cred.api_key = "KEY"
+        cred.client_id = "CID"
+        cred.password = "PIN"
+        cred.totp_secret = "JBSWY3DPEHPK3PXP"
+        db_session.add(cred)
+        await db_session.commit()
+
+        old_order_updates = MagicMock()
+        old_polling_task = MagicMock()
+        tick_manager = MagicMock()
+        tick_manager._api_key = "OLDKEY"
+        tick_manager._client_code = "OLDCID"
+
+        broker = MagicMock()
+        broker._session_listener = object()
+        broker.login.return_value = {
+            "status": True,
+            "data": {
+                "jwtToken": "JWT2",
+                "feedToken": "FEED2",
+                "refreshToken": "REF2",
+                "clientcode": "CID",
+            },
+        }
+        broker.session_tokens = {
+            "auth_token": "JWT2",
+            "feed_token": "FEED2",
+            "refresh_token": "REF2",
+            "api_key": "KEY",
+            "client_code": "CID",
+        }
+
+        runtime = SimpleNamespace(
+            user_id=test_user.id,
+            broker=broker,
+            tick_manager=tick_manager,
+            order_updates=old_order_updates,
+            polling_task=old_polling_task,
+            session_refresh_in_progress=False,
+            _handle_order_update=AsyncMock(),
+        )
+        _RUNTIMES[test_user.id] = runtime
+
+        class FakeOrderUpdateManager:
+            def __init__(self):
+                self.is_running = True
+                self.started = None
+
+            def start(self, *args, **kwargs):
+                self.started = (args, kwargs)
+
+            def stop(self):
+                return None
+
+        try:
+            with patch("app.engine.runtime.OrderUpdateManager", FakeOrderUpdateManager):
+                refreshed = await refresh_runtime_broker_session(
+                    db_session,
+                    test_user.id,
+                    restart_streams=True,
+                )
+
+            assert refreshed is True
+            assert cred.jwt_token == "JWT2"
+            assert cred.feed_token == "FEED2"
+            assert cred.refresh_token == "REF2"
+            broker.login.assert_called_once_with("CID", "PIN", "JBSWY3DPEHPK3PXP")
+            old_order_updates.stop.assert_called_once()
+            old_polling_task.cancel.assert_called_once()
+            tick_manager.restart_with_credentials.assert_called_once_with(
+                auth_token="JWT2",
+                feed_token="FEED2",
+                api_key="KEY",
+                client_code="CID",
+            )
+            assert runtime.order_updates is not None
+            assert isinstance(runtime.order_updates, FakeOrderUpdateManager)
+            assert runtime.order_updates.started is not None
+        finally:
+            _RUNTIMES.pop(test_user.id, None)
+            monkeypatch.setattr(settings, "NEBULA_BROKER_BACKEND", old_backend)
+
 
 class TestTimeParsing:
     def test_parse_exchange_timestamp_epoch_ms(self):
@@ -194,6 +307,64 @@ class TestTimeParsing:
     def test_parse_exchange_timestamp_iso(self):
         parsed = parse_exchange_timestamp("2024-01-01T09:15:01+05:30")
         assert parsed == datetime.datetime(2024, 1, 1, 9, 15, 1, tzinfo=IST)
+
+
+class TestSmartClientReauth:
+    def test_invalid_session_reauthenticates_and_retries(self):
+        class DummySmart:
+            def __init__(self):
+                self.access_token = ""
+                self.feed_token = ""
+                self.refresh_token = ""
+                self.userId = ""
+                self.generate_calls = 0
+                self.candle_calls = 0
+
+            def generateSession(self, client_id, password, totp):
+                self.generate_calls += 1
+                self.access_token = f"JWT{self.generate_calls}"
+                self.feed_token = f"FEED{self.generate_calls}"
+                self.refresh_token = f"REF{self.generate_calls}"
+                self.userId = client_id
+                return {
+                    "status": True,
+                    "data": {
+                        "jwtToken": self.access_token,
+                        "feedToken": self.feed_token,
+                        "refreshToken": self.refresh_token,
+                        "clientcode": client_id,
+                    },
+                }
+
+            def getCandleData(self, params):
+                self.candle_calls += 1
+                if self.candle_calls == 1:
+                    return {
+                        "status": False,
+                        "message": "Invalid Session or Session is Expired Please Re-login",
+                        "errorcode": "AB1010",
+                        "data": None,
+                    }
+                return {
+                    "status": True,
+                    "data": [["2024-01-01T09:15:00", 100, 101, 99, 100, 1000]],
+                }
+
+        client = AngelOneClient(api_key="KEY")
+        client.smart = DummySmart()
+        client.login("CID", "PIN", "JBSWY3DPEHPK3PXP")
+
+        candles = client.get_candle_data(
+            symbol_token="3045",
+            interval="FIVE_MINUTE",
+            from_date="2024-01-01 09:15",
+            to_date="2024-01-01 09:20",
+        )
+
+        assert len(candles) == 1
+        assert client.smart.generate_calls == 2
+        assert client.smart.candle_calls == 2
+        assert client.session_tokens["auth_token"] == "JWT2"
 
 
 class TestConnectionManager:

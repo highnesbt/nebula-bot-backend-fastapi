@@ -1,7 +1,8 @@
 """Live Angel One broker client — wraps SmartConnect with order lifecycle methods."""
 
+import logging
 import time as _time
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import pyotp
 from SmartApi import SmartConnect
@@ -17,6 +18,16 @@ from app.broker.exceptions import BrokerAuthError, BrokerDataError, BrokerOrderE
 from app.broker.totp import normalize_totp_secret
 from app.engine.pricing import round_to_tick_size
 
+logger = logging.getLogger(__name__)
+
+_SESSION_ERROR_CODES = {"AB1010", "AG8001"}
+_SESSION_ERROR_SNIPPETS = (
+    "invalid session",
+    "session is expired",
+    "please re-login",
+    "invalid token",
+)
+
 
 class AngelOneClient:
     """Production broker client wrapping SmartConnect."""
@@ -25,15 +36,27 @@ class AngelOneClient:
         self.api_key = api_key
         self.smart = SmartConnect(api_key=api_key)
         self._authenticated = False
+        self._client_id = ""
+        self._password = ""
+        self._totp_secret = ""
+        self._session_listener: Callable[[dict], None] | None = None
+
+    def set_session_listener(self, callback: Callable[[dict], None] | None):
+        """Register a callback for successful session refreshes."""
+        self._session_listener = callback
 
     def login(self, client_id: str, password: str, totp_secret: str) -> dict:
         """Generate session with Angel One."""
         try:
             normalized_secret = normalize_totp_secret(totp_secret)
+            self._client_id = client_id
+            self._password = password
+            self._totp_secret = normalized_secret
             totp = pyotp.TOTP(normalized_secret).now()
             data = self.smart.generateSession(client_id, password, totp)
             if data.get("status"):
                 self._authenticated = True
+                self._notify_session_listener(data)
                 return data
             raise BrokerAuthError(data.get("message", "Login failed"))
         except ValueError as exc:
@@ -46,14 +69,28 @@ class AngelOneClient:
     @property
     def ws_credentials(self) -> Optional[dict]:
         """Return WebSocket credentials if authenticated."""
-        if self._authenticated and self.smart.access_token and self.smart.feed_token:
+        access_token = getattr(self.smart, "access_token", "")
+        feed_token = getattr(self.smart, "feed_token", "")
+        user_id = getattr(self.smart, "userId", "")
+        if self._authenticated and access_token and feed_token:
             return {
-                "auth_token": self.smart.access_token,
-                "feed_token": self.smart.feed_token,
+                "auth_token": access_token,
+                "feed_token": feed_token,
                 "api_key": self.api_key,
-                "client_code": self.smart.userId or "",
+                "client_code": user_id or "",
             }
         return None
+
+    @property
+    def session_tokens(self) -> dict:
+        """Return the currently cached session token set."""
+        return {
+            "auth_token": getattr(self.smart, "access_token", "") or "",
+            "feed_token": getattr(self.smart, "feed_token", "") or "",
+            "refresh_token": getattr(self.smart, "refresh_token", "") or "",
+            "api_key": self.api_key,
+            "client_code": getattr(self.smart, "userId", "") or self._client_id,
+        }
 
     def get_candle_data(
         self, symbol_token: str, interval: str,
@@ -68,7 +105,10 @@ class AngelOneClient:
             "todate": to_date,
         }
         try:
-            result = self.smart.getCandleData(params)
+            result = self._request_with_auto_reauth(
+                lambda: self.smart.getCandleData(params),
+                operation_name="get_candle_data",
+            )
             if result.get("status") and result.get("data"):
                 return result["data"]
             raise BrokerDataError(result.get("message", "No data"))
@@ -99,7 +139,10 @@ class AngelOneClient:
             "price": str(normalized_price),
         }
         try:
-            response = self.smart._postRequest("api.order.place", params)
+            response = self._request_with_auto_reauth(
+                lambda: self.smart._postRequest("api.order.place", params),
+                operation_name="place_order",
+            )
             if response and response.get("status"):
                 data = response.get("data")
                 if data and "orderid" in data:
@@ -122,7 +165,10 @@ class AngelOneClient:
         """Cancel a pending order."""
         try:
             params = {"variety": variety, "orderid": order_id}
-            response = self.smart._postRequest("api.order.cancel", params)
+            response = self._request_with_auto_reauth(
+                lambda: self.smart._postRequest("api.order.cancel", params),
+                operation_name="cancel_order",
+            )
             return bool(response and response.get("status"))
         except Exception:
             return False
@@ -139,7 +185,10 @@ class AngelOneClient:
                 "price": str(round_to_tick_size(new_price)),
                 **kwargs,
             }
-            response = self.smart._postRequest("api.order.modify", params)
+            response = self._request_with_auto_reauth(
+                lambda: self.smart._postRequest("api.order.modify", params),
+                operation_name="modify_order",
+            )
             return bool(response and response.get("status"))
         except Exception:
             return False
@@ -147,7 +196,10 @@ class AngelOneClient:
     def get_order_status(self, order_id: str) -> dict:
         """Get current status of an order. Returns latest status entry."""
         try:
-            result = self.smart.individual_order_details(order_id)
+            result = self._request_with_auto_reauth(
+                lambda: self.smart.individual_order_details(order_id),
+                operation_name="get_order_status",
+            )
             if result and result.get("status") and result.get("data"):
                 orders = result["data"]
                 for entry in reversed(orders):
@@ -165,7 +217,10 @@ class AngelOneClient:
         """Poll for order fill price."""
         for attempt in range(max_attempts):
             try:
-                result = self.smart.individual_order_details(order_id)
+                result = self._request_with_auto_reauth(
+                    lambda: self.smart.individual_order_details(order_id),
+                    operation_name="get_order_fill_price",
+                )
                 if result and result.get("status") and result.get("data"):
                     for entry in reversed(result["data"]):
                         status = (entry.get("orderstatus") or "").lower()
@@ -183,7 +238,10 @@ class AngelOneClient:
     def get_ltp(self, exchange: str, symbol: str, token: str) -> float:
         """Get last traded price."""
         try:
-            result = self.smart.ltpData(exchange, symbol, token)
+            result = self._request_with_auto_reauth(
+                lambda: self.smart.ltpData(exchange, symbol, token),
+                operation_name="get_ltp",
+            )
             if result.get("status") and result.get("data"):
                 return float(result["data"]["ltp"])
             raise BrokerDataError("LTP fetch failed")
@@ -195,7 +253,10 @@ class AngelOneClient:
     def search_scrip(self, exchange: str, query: str) -> list:
         """Search for scrips by name."""
         try:
-            result = self.smart.searchScrip(exchange, query)
+            result = self._request_with_auto_reauth(
+                lambda: self.smart.searchScrip(exchange, query),
+                operation_name="search_scrip",
+            )
             if result.get("status") and result.get("data"):
                 return result["data"]
             return []
@@ -208,3 +269,71 @@ class AngelOneClient:
             self.smart.terminateSession(client_id)
         except Exception:
             pass
+
+    def _request_with_auto_reauth(
+        self,
+        operation: Callable[[], Any],
+        operation_name: str,
+        allow_retry: bool = True,
+    ):
+        try:
+            response = operation()
+        except Exception as exc:
+            if allow_retry and self._is_session_error(exc):
+                self._reauthenticate(operation_name)
+                return self._request_with_auto_reauth(
+                    operation,
+                    operation_name,
+                    allow_retry=False,
+                )
+            raise
+
+        if allow_retry and self._is_session_payload(response):
+            self._reauthenticate(operation_name)
+            return self._request_with_auto_reauth(
+                operation,
+                operation_name,
+                allow_retry=False,
+            )
+
+        return response
+
+    def _reauthenticate(self, operation_name: str):
+        if not self._client_id or not self._password or not self._totp_secret:
+            raise BrokerAuthError(
+                f"{operation_name} failed: broker session expired and no cached credentials are available."
+            )
+
+        logger.warning(
+            "SmartAPI session expired during %s; attempting automatic re-auth.",
+            operation_name,
+        )
+        self.login(self._client_id, self._password, self._totp_secret)
+
+    def _notify_session_listener(self, login_data: dict):
+        if self._session_listener is None:
+            return
+
+        payload = login_data.get("data") or {}
+        session = {
+            "auth_token": getattr(self.smart, "access_token", "") or payload.get("jwtToken", ""),
+            "feed_token": getattr(self.smart, "feed_token", "") or payload.get("feedToken", ""),
+            "refresh_token": getattr(self.smart, "refresh_token", "") or payload.get("refreshToken", ""),
+            "api_key": self.api_key,
+            "client_code": getattr(self.smart, "userId", "") or payload.get("clientcode", self._client_id),
+        }
+        self._session_listener(session)
+
+    def _is_session_payload(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        code = str(payload.get("errorcode") or payload.get("errorCode") or "").upper()
+        message = str(payload.get("message") or payload.get("errorMessage") or "").lower()
+        return code in _SESSION_ERROR_CODES or any(
+            snippet in message for snippet in _SESSION_ERROR_SNIPPETS
+        )
+
+    def _is_session_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(snippet in text for snippet in _SESSION_ERROR_SNIPPETS)

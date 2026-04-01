@@ -90,6 +90,30 @@ class TickDataManager:
         self._connection_open_callback = on_open
         self._connection_close_callback = on_close
 
+    def update_credentials(
+        self,
+        auth_token: str,
+        feed_token: str,
+        api_key: str,
+        client_code: str,
+    ):
+        self._auth_token = auth_token
+        self._feed_token = feed_token
+        self._api_key = api_key
+        self._client_code = client_code
+
+    def restart_with_credentials(
+        self,
+        auth_token: str,
+        feed_token: str,
+        api_key: str,
+        client_code: str,
+    ):
+        """Swap session credentials and reconnect the market WebSocket."""
+        self.stop()
+        self.update_credentials(auth_token, feed_token, api_key, client_code)
+        self.start()
+
     @property
     def is_connected(self) -> bool:
         return self._connected
