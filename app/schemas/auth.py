@@ -1,6 +1,8 @@
 """Auth-related Pydantic schemas."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from app.broker.totp import normalize_totp_secret
 
 
 class LoginIn(BaseModel):
@@ -28,6 +30,11 @@ class BrokerCredentialIn(BaseModel):
     client_id: str
     password: str
     totp_secret: str
+
+    @field_validator("totp_secret")
+    @classmethod
+    def validate_totp_secret(cls, value: str) -> str:
+        return normalize_totp_secret(value)
 
 
 class BrokerCredentialOut(BaseModel):

@@ -14,6 +14,7 @@ from app.broker.constants import (
     VARIETY_NORMAL,
 )
 from app.broker.exceptions import BrokerAuthError, BrokerDataError, BrokerOrderError
+from app.broker.totp import normalize_totp_secret
 from app.engine.pricing import round_to_tick_size
 
 
@@ -28,12 +29,15 @@ class AngelOneClient:
     def login(self, client_id: str, password: str, totp_secret: str) -> dict:
         """Generate session with Angel One."""
         try:
-            totp = pyotp.TOTP(totp_secret).now()
+            normalized_secret = normalize_totp_secret(totp_secret)
+            totp = pyotp.TOTP(normalized_secret).now()
             data = self.smart.generateSession(client_id, password, totp)
             if data.get("status"):
                 self._authenticated = True
                 return data
             raise BrokerAuthError(data.get("message", "Login failed"))
+        except ValueError as exc:
+            raise BrokerAuthError(f"Invalid TOTP secret format: {exc}") from exc
         except BrokerAuthError:
             raise
         except Exception as e:

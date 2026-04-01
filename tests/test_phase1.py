@@ -7,6 +7,7 @@ from passlib.hash import django_pbkdf2_sha256
 from app.auth import create_access_token, hash_password, verify_password
 from app.main import app
 from app.models.user import BrokerCredential, User, encrypt_value, decrypt_value
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from httpx import AsyncClient
 
@@ -191,6 +192,43 @@ class TestBrokerCredentialsAPI:
         assert "****" in data["api_key"] or "*" in data["api_key"]
 
     @pytest.mark.asyncio
+    async def test_save_credentials_normalizes_totp_secret(
+        self, client: AsyncClient, auth_headers: dict, db_session
+    ):
+        resp = await client.post(
+            "/api/auth/broker/credentials",
+            json={
+                "api_key": "MYAPIKEY123",
+                "client_id": "S99999",
+                "password": "topsecret",
+                "totp_secret": "jbsw-y3dp-ehpk-3pxp",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+
+        result = await db_session.execute(select(BrokerCredential))
+        cred = result.scalar_one()
+        assert cred.totp_secret == "JBSWY3DPEHPK3PXP"
+
+    @pytest.mark.asyncio
+    async def test_save_credentials_rejects_invalid_totp_secret(
+        self, client: AsyncClient, auth_headers: dict
+    ):
+        resp = await client.post(
+            "/api/auth/broker/credentials",
+            json={
+                "api_key": "MYAPIKEY123",
+                "client_id": "S99999",
+                "password": "topsecret",
+                "totp_secret": "ABCD-1089-EFGH",
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 422
+        assert "TOTP secret must use only A-Z and digits 2-7." in str(resp.json())
+
+    @pytest.mark.asyncio
     async def test_delete_credentials(
         self, client: AsyncClient, auth_headers: dict
     ):
@@ -200,7 +238,7 @@ class TestBrokerCredentialsAPI:
                 "api_key": "KEY",
                 "client_id": "CID",
                 "password": "PW",
-                "totp_secret": "TS",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
             },
             headers=auth_headers,
         )
